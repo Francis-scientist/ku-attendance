@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "779395263234",
+    "project_id": "ku-attendance",
+    "storage_bucket": "ku-attendance.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:779395263234:android:02fefdc1c4686b35c3701b",
+        "android_client_info": {
+          "package_name": "com.example.am_in"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn5S2D-q7O4JJrO1xZR1ogr1XM3c3rtmI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:779395263234:android:461909e55b3cd84bc3701b",
+        "android_client_info": {
+          "package_name": "ke.ac.ku.attendance"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn5S2D-q7O4JJrO1xZR1ogr1XM3c3rtmI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
