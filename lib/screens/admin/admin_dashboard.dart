@@ -11,6 +11,7 @@ import 'package:am_in/providers/data_providers.dart';
 import 'package:am_in/widgets/state_views.dart';
 import 'package:am_in/widgets/stat_card.dart';
 import 'package:am_in/widgets/status_chip.dart';
+import 'package:am_in/widgets/sign_out_button.dart';
 
 /// The administrator's overview: headline counts across the platform plus a
 /// live list of every session currently running.
@@ -35,6 +36,7 @@ class AdminDashboard extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('KU Attendance'),
         centerTitle: false,
+        actions: const <Widget>[SignOutButton()],
       ),
       body: RefreshIndicator(
         onRefresh: () async {

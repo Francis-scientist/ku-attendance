@@ -8,6 +8,7 @@ import 'package:am_in/widgets/app_feedback.dart';
 import 'package:am_in/widgets/app_text_field.dart';
 import 'package:am_in/widgets/async_value_view.dart';
 import 'package:am_in/widgets/primary_button.dart';
+import 'package:am_in/widgets/sign_out_button.dart';
 
 /// Shared profile tab for every role: shows the signed-in user's details,
 /// allows editing the non-sensitive fields (name, department, faculty, phone)
@@ -74,30 +75,6 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     }
   }
 
-  Future<void> _confirmSignOut() async {
-    final bool? ok = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: const Text('Sign out'),
-        content: const Text('Are you sure you want to sign out?'),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Sign out'),
-          ),
-        ],
-      ),
-    );
-    if (ok ?? false) {
-      await ref.read(authControllerProvider.notifier).signOut();
-      // Router redirect returns to the login screen automatically.
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final AsyncValue<AppUser?> userAsync = ref.watch(currentUserProvider);
@@ -105,13 +82,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Profile'),
-        actions: <Widget>[
-          IconButton(
-            tooltip: 'Sign out',
-            onPressed: _confirmSignOut,
-            icon: const Icon(Icons.logout),
-          ),
-        ],
+        actions: const <Widget>[SignOutButton()],
       ),
       body: AsyncValueView<AppUser?>(
         value: userAsync,

@@ -1,0 +1,192 @@
+rules_version = '2';
+
+// KU Attendance — Firestore Security Rules
+//
+// Principles:
+//  * Nothing is world-readable or world-writable. There is no `if true`.
+//  * A user's ROLE is authoritative in their `users/{uid}` document and can
+//    never be self-escalated (a client may only ever self-assign student or
+//    lecturer at creation, and can never change their own role afterwards).
+//  * Attendance RECORDS: a student may create only their OWN record, once, and
+//    only while active + enrolled + inside an open session with the correct
+//    OTP (all enforced below). Records can never be edited or deleted from a
+//    client. NOTE: the geofence is checked in the app only — rules have no
+//    trigonometry — so move that check server-side when the Cloud Function is
+//    deployed and tighten records back to `allow write: if false`.
+//  * The session OTP lives in a locked `private/` subcollection that only the
+//    owning lecturer (or an admin) can read — students never see it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- Helpers ----
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // The caller's own user document (used to read their role). Costs one
+    // document read per evaluation but keeps role checks authoritative.
+    function selfDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasRole(role) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && selfDoc().role == role;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function isLecturer() {
+      return hasRole('lecturer');
+    }
+
+    function sessionData(sessionId) {
+      return get(/databases/$(database)/documents/attendanceSessions/$(sessionId)).data;
+    }
+
+    // The OTP for a session, read from the locked subcollection. get() in rules
+    // bypasses read restrictions, so this validates a student's submitted code
+    // WITHOUT ever exposing it to the student's device.
+    function sessionOtp(sessionId) {
+      return get(/databases/$(database)/documents/attendanceSessions/$(sessionId)/private/otp).data.otp;
+    }
+
+    // Whether the signed-in user holds an ACTIVE enrollment in the given course
+    // (enrollment ids are deterministic: `courseId__studentId`).
+    function enrollmentActive(courseId) {
+      return exists(/databases/$(database)/documents/enrollments/$(courseId + '__' + request.auth.uid))
+        && get(/databases/$(database)/documents/enrollments/$(courseId + '__' + request.auth.uid)).data.isActive == true;
+    }
+
+    // ---- Users ----
+    match /users/{uid} {
+      // Read own profile; admins may read/list everyone.
+      allow get: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+
+      // Self-registration: only for your own uid, only as student/lecturer,
+      // and the account must start active. Admins are provisioned server-side,
+      // never through the client — so 'admin' is rejected here.
+      allow create: if isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role in ['student', 'lecturer']
+        && request.resource.data.isActive == true
+        && request.resource.data.name is string
+        && request.resource.data.email is string;
+
+      // A user may edit their own profile but NOT their role, active flag, or
+      // email. Admins may change anything (e.g. disable an account, fix a role).
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          request.auth.uid == uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.isActive == resource.data.isActive
+          && request.resource.data.email == resource.data.email
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ---- Courses ----
+    match /courses/{courseId} {
+      // Any authenticated user may read the catalogue (lecturers query by
+      // assignment, admins manage, students' enrolments reference it).
+      allow read: if isSignedIn();
+      // Only admins create/edit/remove courses and assign lecturers.
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ---- Enrollments ----
+    match /enrollments/{enrollmentId} {
+      // A student may read their own enrolments; lecturers and admins may read
+      // rosters. (A student's `studentId == uid` query satisfies this per-doc.)
+      allow read: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid || isLecturer() || isAdmin()
+      );
+      // Enrolment is administered centrally; students cannot enroll themselves.
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ---- Attendance sessions ----
+    match /attendanceSessions/{sessionId} {
+      // Enrolled students stream sessions to discover active ones. The document
+      // holds NO OTP, so read access here is safe.
+      allow read: if isSignedIn();
+
+      // A lecturer may open a session only in their own name.
+      allow create: if isLecturer()
+        && request.resource.data.lecturerId == request.auth.uid;
+
+      // Owning lecturer (or admin) may modify a session, e.g. to close it.
+      // Additionally, a student marking present may increment `presentCount` by
+      // exactly one — and change nothing else — but only in the same commit
+      // that creates their own attendance record (getAfter ties the two
+      // together, so the counter cannot be inflated without a real record, and
+      // a record can be created only once).
+      allow update: if isAdmin()
+        || (isSignedIn() && resource.data.lecturerId == request.auth.uid)
+        || (
+          hasRole('student')
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['presentCount'])
+          && request.resource.data.presentCount == resource.data.presentCount + 1
+          && getAfter(/databases/$(database)/documents/attendanceSessions/$(sessionId)/records/$(request.auth.uid)).data.studentId == request.auth.uid
+        );
+
+      allow delete: if isAdmin();
+
+      // Locked OTP store: readable/writable only by the owning lecturer/admin.
+      // Students can neither read the code nor forge one.
+      match /private/{doc} {
+        allow read, write: if isAdmin()
+          || (isSignedIn()
+              && sessionData(sessionId).lecturerId == request.auth.uid);
+      }
+
+      // Attendance records (doc id == studentId, which structurally prevents
+      // duplicates). Reads: the student themselves, the owning lecturer, or an
+      // admin.
+      match /records/{studentId} {
+        allow read: if isAdmin()
+          || request.auth.uid == studentId
+          || sessionData(sessionId).lecturerId == request.auth.uid;
+
+        // Client-side marking (interim, while the markAttendance Cloud Function
+        // is not deployed). Every check here is enforced server-side by the
+        // rules engine: the caller is an active student writing ONLY their own
+        // record, for this session's course, stamped with the server clock,
+        // while the session is active and before its expiry, the student is
+        // enrolled, and the submitted OTP matches the locked code. Duplicate
+        // marking is impossible (doc id == uid, and updates are denied).
+        // NOTE: the geofence is NOT enforced here — rules have no trigonometry —
+        // so latitude/longitude/distance are validated in the app only.
+        allow create: if isSignedIn()
+          && studentId == request.auth.uid
+          && hasRole('student')
+          && selfDoc().isActive == true
+          && request.resource.data.studentId == request.auth.uid
+          && request.resource.data.sessionId == sessionId
+          && request.resource.data.status == 'present'
+          && request.resource.data.courseId == sessionData(sessionId).courseId
+          && request.resource.data.markedAt == request.time
+          && sessionData(sessionId).isActive == true
+          && request.time < sessionData(sessionId).expiresAt
+          && enrollmentActive(sessionData(sessionId).courseId)
+          && request.resource.data.submittedOtp == sessionOtp(sessionId);
+
+        // Attendance is immutable once submitted — no client edits or deletes.
+        allow update, delete: if false;
+      }
+    }
+
+    // Collection-group reads of `records` (a student's cross-session history).
+    // Because a record's document id is the student's uid, a student may read
+    // only their own records; admins may read all.
+    match /{path=**}/records/{studentId} {
+      allow read: if isAdmin() || request.auth.uid == studentId;
+    }
+  }
+}

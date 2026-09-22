@@ -62,7 +62,6 @@ final enrollmentRepositoryProvider = Provider<EnrollmentRepository>(
 final attendanceRepositoryProvider = Provider<AttendanceRepository>(
   (Ref ref) => AttendanceRepository(
     ref.watch(firestoreProvider),
-    ref.watch(functionsProvider),
     ref.watch(locationServiceProvider),
   ),
 );

@@ -1,10 +1,10 @@
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 
 import 'package:am_in/core/constants/app_constants.dart';
 import 'package:am_in/core/errors/app_exception.dart';
+import 'package:am_in/core/utils/geo.dart';
 import 'package:am_in/models/app_user.dart';
 import 'package:am_in/models/attendance_record.dart';
 import 'package:am_in/models/attendance_session.dart';
@@ -31,15 +31,17 @@ class StartedSession {
 /// - Lecturers create/close sessions directly (guarded by Security Rules).
 /// - The OTP is generated with a cryptographically secure RNG and stored in
 ///   `attendanceSessions/{id}/private/otp` (lecturer/admin-readable only).
-/// - Students NEVER write attendance directly. Marking goes through the
-///   `markAttendance` Cloud Function, which is the sole authority on OTP,
-///   geofence, enrollment, duplicates and server time.
+/// - Students mark attendance by creating their OWN record (interim client-side
+///   path, used while the `markAttendance` Cloud Function is not deployed).
+///   Security Rules still enforce identity, active session, server-clock expiry,
+///   enrollment, the OTP and single-submission; only the geofence is checked
+///   on-device. When the function is later deployed, route marking through it
+///   again and tighten `records` back to `allow write: if false`.
 class AttendanceRepository {
   final FirebaseFirestore _db;
-  final FirebaseFunctions _functions;
   final LocationService _location;
 
-  AttendanceRepository(this._db, this._functions, this._location);
+  AttendanceRepository(this._db, this._location);
 
   CollectionReference<Map<String, dynamic>> get _sessions =>
       _db.collection(AppConstants.sessionsCollection);
@@ -196,32 +198,88 @@ class AttendanceRepository {
       .map((QuerySnapshot<Map<String, dynamic>> snap) =>
           snap.docs.map(AttendanceRecord.fromDoc).toList());
 
-  /// Marks attendance via the authoritative Cloud Function.
+  /// Marks the signed-in student present by writing their own attendance
+  /// record directly (interim client-side path, while the `markAttendance`
+  /// Cloud Function is not deployed).
   ///
-  /// Flow: obtain a location fix on-device (throws a friendly [AppException] on
-  /// permission/GPS problems) → call the function with the OTP + coordinates →
-  /// the server validates everything and writes the record. If offline, the
-  /// callable fails immediately (it never queues), so we never falsely report
-  /// success.
+  /// Security Rules still enforce, server-side: the caller is an active student
+  /// writing ONLY their own record for this session's course, stamped with the
+  /// server clock, while the session is active and before expiry, the student
+  /// is enrolled, the submitted OTP matches the locked code, and the record is
+  /// created exactly once (never edited/deleted). The single check rules cannot
+  /// perform is the geofence (no trigonometry), so distance is validated here.
   Future<void> markAttendance({
-    required String sessionId,
+    required AttendanceSession session,
+    required AppUser student,
     required String otp,
   }) async {
-    // 1. Location fix (may throw AppException — surfaced directly to the user).
+    // 1. Location fix (throws a friendly AppException on GPS/permission issues).
     final LocationReading reading = await _location.getCurrentReading();
 
-    // 2. Authoritative server-side validation + write.
+    // 2. Geofence — client-side only without the Cloud Function.
+    if (!Geo.isValidCoordinate(session.latitude, session.longitude)) {
+      throw const AppException(
+        'This session has no valid location set, so attendance cannot be '
+        'checked. Please contact your lecturer.',
+        code: 'session-no-location',
+      );
+    }
+    final double distance = Geo.distanceMeters(
+      session.latitude,
+      session.longitude,
+      reading.latitude,
+      reading.longitude,
+    );
+    if (!Geo.isWithinRadius(distance, session.radius)) {
+      throw AppException(
+        'You are about ${distance.round()} m away — outside the '
+        '${session.radius.round()} m attendance zone. Move closer and try again.',
+        code: 'outside-geofence',
+      );
+    }
+
+    // 3. Write the record and bump the live counter atomically. The record's
+    //    document id is the student uid, so a repeat attempt targets the same
+    //    document and is rejected — attendance can be marked exactly once.
     try {
-      final HttpsCallable callable =
-          _functions.httpsCallable(AppConstants.markAttendanceCallable);
-      await callable.call<dynamic>(<String, dynamic>{
-        'sessionId': sessionId,
-        'otp': otp,
-        'latitude': reading.latitude,
-        'longitude': reading.longitude,
-        'accuracy': reading.accuracy,
-        'isMocked': reading.isMocked,
+      final DocumentReference<Map<String, dynamic>> sessionRef =
+          _sessions.doc(session.id);
+      final DocumentReference<Map<String, dynamic>> recordRef = sessionRef
+          .collection(AppConstants.recordsSubcollection)
+          .doc(student.uid);
+
+      await _db.runTransaction((Transaction tx) async {
+        final DocumentSnapshot<Map<String, dynamic>> existing =
+            await tx.get(recordRef);
+        if (existing.exists) {
+          throw const AppException(
+            'You have already marked attendance for this session.',
+            code: 'already-marked',
+          );
+        }
+        tx.set(recordRef, <String, dynamic>{
+          'studentId': student.uid,
+          'studentName': student.name,
+          if (student.admissionNumber != null)
+            'admissionNumber': student.admissionNumber,
+          'courseId': session.courseId,
+          'courseCode': session.courseCode,
+          'courseName': session.courseName,
+          'sessionId': session.id,
+          'latitude': reading.latitude,
+          'longitude': reading.longitude,
+          'distanceFromLecturer': distance,
+          'status': 'present',
+          // Read by Security Rules to verify against the locked OTP without ever
+          // exposing that code to the student's device.
+          'submittedOtp': otp,
+          'markedAt': FieldValue.serverTimestamp(),
+        });
+        tx.update(sessionRef,
+            <String, dynamic>{'presentCount': FieldValue.increment(1)});
       });
+    } on AppException {
+      rethrow;
     } catch (error) {
       throw ErrorMapper.map(error);
     }
