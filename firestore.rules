@@ -183,10 +183,13 @@ service cloud.firestore {
     }
 
     // Collection-group reads of `records` (a student's cross-session history).
-    // Because a record's document id is the student's uid, a student may read
-    // only their own records; admins may read all.
-    match /{path=**}/records/{studentId} {
-      allow read: if isAdmin() || request.auth.uid == studentId;
+    // A student's history screen queries `collectionGroup('records')` filtered
+    // by the `studentId` FIELD, so the rule must authorize on that same field —
+    // Firestore validates a collection-group query against its `where` clauses,
+    // and a doc-id match (`request.auth.uid == recordId`) cannot be proven to
+    // match a field filter, which would reject the whole query. Admins read all.
+    match /{path=**}/records/{recordId} {
+      allow read: if isAdmin() || resource.data.studentId == request.auth.uid;
     }
   }
 }
